@@ -27,3 +27,5 @@ app.use("/api/seguridad", seguridadRouter);
 app.listen(process.env.PORT, () => {
   console.log(`🚀 Servidor corriendo en puerto ${process.env.PORT}`);
 });
+
+export default app;
