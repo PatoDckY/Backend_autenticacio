@@ -1,0 +1,16 @@
+{
+  "rewrites": [
+    {
+      "source": "/auth/(.*)",
+      "destination": "/back/server.js"
+    },
+    {
+      "source": "/test-mail/(.*)",
+      "destination": "/back/server.js"
+    },
+    {
+      "source": "/api/seguridad/(.*)",
+      "destination": "/back/server.js"
+    }
+  ]
+}
