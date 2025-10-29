@@ -3,7 +3,7 @@ import cors from "cors";
 import dotenv from "dotenv";
 import authRoutes from "./routes/auth.js";
 import testMailRoutes from "./routes/test-mail.js";
-import seguridadRouter from "./routes/seguridad.js";
+// import seguridadRouter from "./routes/seguridad.js";
 
 dotenv.config();
 
@@ -21,11 +21,11 @@ app.get("/", (req, res) => {
 // Rutas
 app.use("/auth", authRoutes);
 app.use("/test-mail", testMailRoutes);
-app.use("/api/seguridad", seguridadRouter);
+// app.use("/api/seguridad", seguridadRouter);
 
 // Servidor
-app.listen(process.env.PORT, () => {
-  console.log(`🚀 Servidor corriendo en puerto ${process.env.PORT}`);
+app.get("/", (req, res) => {
+  res.send("🚀 El backend de autenticación está funcionando.");
 });
 
 export default app;
