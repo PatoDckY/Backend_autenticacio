@@ -31,17 +31,17 @@ router.post("/register", async (req, res) => {
         telefono,
         edad,
         correo,
-        contraseña,
+        contrasena,
     } = req.body;
 
-    if (!nombre || !correo || !contraseña)
+    if (!nombre || !correo || !contrasena)
         return res.status(400).json({ mensaje: "Faltan datos obligatorios" });
 
     try {
-        const hash = await bcrypt.hash(contraseña, 10);
+        const hash = await bcrypt.hash(contrasena, 10);
         const sql = `
             INSERT INTO usuarios 
-            (nombre, apellido_paterno, apellido_materno, telefono, edad, correo, contraseña) 
+            (nombre, apellido_paterno, apellido_materno, telefono, edad, correo, contrasena) 
             VALUES (?, ?, ?, ?, ?, ?, ?)
         `;
 
@@ -63,7 +63,7 @@ router.post("/register", async (req, res) => {
 });
 
 router.post("/login", (req, res) => {
-    const { correo, contraseña } = req.body;
+    const { correo, contrasena } = req.body;
 
     const sql = "SELECT * FROM usuarios WHERE correo = ?";
     connection.query(sql, [correo], async (err, results) => {
@@ -71,10 +71,10 @@ router.post("/login", (req, res) => {
             return res.status(401).json({ mensaje: "Credenciales inválidas" });
 
         const usuario = results[0];
-        const match = await bcrypt.compare(contraseña, usuario.contraseña);
+        const match = await bcrypt.compare(contrasena, usuario.contrasena);
 
         if (!match)
-            return res.status(401).json({ mensaje: "Contraseña incorrecta" });
+            return res.status(401).json({ mensaje: "Contrasena incorrecta" });
 
         if (usuario.tfa_enabled) {
             const tempToken = generateTempToken(usuario.id, usuario.correo);
