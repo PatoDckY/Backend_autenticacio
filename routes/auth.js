@@ -19,6 +19,20 @@ import {
     authenticateJWT
 } from "../middlaware/seguridad.js";
 
+import { 
+  generateRegistrationOptions,
+  verifyRegistrationResponse,
+  generateAuthenticationOptions,
+  verifyAuthenticationResponse
+} from '@simplewebauthn/server';
+
+import { isoBase64URL, isoUint8Array } from '@simplewebauthn/server/helpers';
+
+const rpID = process.env.RP_ID || "localhost";
+const rpName = "Tu App de Autenticación";
+const origin = process.env.FRONTEND_URL || "http://localhost:8080";
+
+const passkeyChallengeStore = new Map();
 const router = express.Router();
 
 // === FLUJO DE AUTENTICACIÓN PRINCIPAL ===
@@ -191,7 +205,7 @@ router.post("/magic-link", async (req, res) => {
 
     try {
         const token = jwt.sign({ correo }, process.env.JWT_SECRET, { expiresIn: "5m" });
-        const enlace = `http://localhost:8080/magic-login/${token}`;
+        const enlace = `${process.env.FRONTEND_URL}/magic-login/${token}`;
 
         const transporter = nodemailer.createTransport({
             service: "gmail",
@@ -273,6 +287,303 @@ router.get("/test-mail", async (req, res) => {
     } catch (error) {
         console.error(error);
         res.status(500).send("Error al enviar el correo ❌");
+    }
+});
+
+// === PASSKEYS - VERSIÓN 8.3.4 ===
+
+router.post("/passkey/register-options", authenticateJWT, (req, res) => {
+    console.log(">>> Petición LLEGÓ a /passkey/register-options v8.3.4");
+
+    if (!req.user || !req.user.id || !req.user.correo) {
+        return res.status(500).json({ mensaje: "Error interno: Datos de usuario no encontrados en token." });
+    }
+
+    const { id: userId, correo: email } = req.user;
+
+    const sqlGetKeys = "SELECT id FROM passkey_credentials WHERE user_id = ?";
+
+    connection.query(sqlGetKeys, [userId], async (err, results) => {
+        if (err) {
+            console.error("Error en consulta SELECT passkey_credentials:", err);
+            return res.status(500).json({ mensaje: "Error DB", error: err.message });
+        }
+
+        const validResults = results.filter(row => row.id && row.id.trim() !== '');
+        const excludeCredentials = validResults.map(row => {
+            try {
+                return {
+                    id: isoBase64URL.toBuffer(row.id), // ✅ Convertir a Buffer para v8.3.4
+                    type: 'public-key'
+                };
+            } catch (mapErr) {
+                console.error("Error convirtiendo ID a Buffer:", row.id, mapErr);
+                return null;
+            }
+        }).filter(cred => cred !== null);
+
+        try {
+            // ✅ v8.3.4: userID como Uint8Array
+            const userIdAsUint8Array = isoUint8Array.fromUTF8String(userId.toString());
+
+            const options = await generateRegistrationOptions({
+                rpName,
+                rpID,
+                userID: userIdAsUint8Array,
+                userName: email,
+                attestationType: 'none',
+                excludeCredentials,
+                authenticatorSelection: {
+                    residentKey: 'preferred',
+                    userVerification: 'preferred',
+                },
+            });
+
+            console.log("Options generadas v8.3.4:", {
+                challenge: options.challenge,
+                userID: options.user?.id
+            });
+
+            passkeyChallengeStore.set(`reg-${userId}`, options.challenge);
+            res.json(options);
+
+        } catch (error) {
+            console.error("Error en generateRegistrationOptions:", error);
+            res.status(500).json({ mensaje: "Error al generar opciones", error: error.message });
+        }
+    });
+});
+
+router.post("/passkey/verify-registration", authenticateJWT, async (req, res) => {
+    console.log(">>> Entrando a /verify-registration v8.3.4");
+    const { id: userId } = req.user;
+    const body = req.body;
+
+    try {
+        // Extraer challenge del clientDataJSON
+        const clientDataJSON = new TextDecoder().decode(
+            isoBase64URL.toBuffer(body.response.clientDataJSON)
+        );
+        const clientData = JSON.parse(clientDataJSON);
+        const expectedChallenge = clientData.challenge;
+        
+        console.log("Challenge esperado:", expectedChallenge);
+
+        const storedChallenge = passkeyChallengeStore.get(`reg-${userId}`);
+        if (storedChallenge !== expectedChallenge) {
+            return res.status(400).json({ mensaje: "Challenge no coincide." });
+        }
+
+        console.log(">>> Intentando verificar con simplewebauthn v8.3.4...");
+        const verification = await verifyRegistrationResponse({
+            response: body,
+            expectedChallenge: storedChallenge,
+            expectedOrigin: origin,
+            expectedRPID: rpID,
+        });
+
+        console.log("Resultado de verificación:", {
+            verified: verification.verified,
+            registrationInfo: !!verification.registrationInfo
+        });
+
+        if (verification.verified && verification.registrationInfo) {
+            // ✅ CORREGIDO: En v8.3.4 los datos están directamente en registrationInfo
+            const registrationInfo = verification.registrationInfo;
+            
+            console.log("RegistrationInfo keys:", Object.keys(registrationInfo));
+            
+            // Extraer datos directamente de registrationInfo
+            const credentialID = registrationInfo.credentialID;
+            const credentialPublicKey = registrationInfo.credentialPublicKey;
+            const counter = registrationInfo.counter || 0;
+            const transportsStr = body.response.transports?.join(',') || '';
+
+            if (!credentialID || !credentialPublicKey) {
+                console.error("!!! Datos de credencial faltantes:", {
+                    hasCredentialID: !!credentialID,
+                    hasCredentialPublicKey: !!credentialPublicKey
+                });
+                return res.status(500).json({ mensaje: "Error: Datos de credencial incompletos" });
+            }
+
+            const idBase64URL = isoBase64URL.fromBuffer(credentialID);
+            const publicKeyBase64URL = isoBase64URL.fromBuffer(credentialPublicKey);
+
+            console.log("Datos a guardar:", {
+                id: idBase64URL,
+                publicKey: publicKeyBase64URL.substring(0, 50) + '...',
+                counter,
+                transports: transportsStr
+            });
+
+            const sqlInsert = `INSERT INTO passkey_credentials (id, user_id, public_key_base64, counter, transports) VALUES (?, ?, ?, ?, ?)`;
+            const values = [idBase64URL, userId, publicKeyBase64URL, counter, transportsStr];
+
+            connection.query(sqlInsert, values, (err) => {
+                if (err) {
+                    console.error("Error al guardar credencial:", err);
+                    return res.status(500).json({ mensaje: "Error al guardar credencial", error: err.message });
+                }
+                
+                console.log(">>> Credencial guardada con éxito.");
+                passkeyChallengeStore.delete(`reg-${userId}`);
+                res.json({ success: true, message: "Passkey registrada." });
+            });
+        } else {
+            res.status(400).json({ mensaje: "Verificación fallida." });
+        }
+    } catch (error) {
+        console.error("Error en verify-registration:", error);
+        res.status(500).json({ mensaje: "Error al verificar registro", error: error.message });
+    }
+});
+
+router.post("/passkey/login-options", async (req, res) => {
+    try {
+        console.log(">>> Generando opciones de login v8.3.4");
+        
+        const options = await generateAuthenticationOptions({
+            rpID,
+            userVerification: 'preferred',
+        });
+
+        console.log("Login options generadas v8.3.4:", {
+            challenge: options.challenge,
+            challengeType: typeof options.challenge
+        });
+
+        // Guardar el challenge en el store
+        passkeyChallengeStore.set(options.challenge, options.challenge);
+
+        res.json(options);
+
+    } catch (error) {
+        console.error("Error en login-options:", error);
+        res.status(500).json({ mensaje: "Error al generar opciones de login", error: error.message });
+    }
+});
+
+router.post("/passkey/verify-login", async (req, res) => {
+    console.log(">>> Iniciando verify-login v8.3.4");
+    const body = req.body;
+
+    try {
+        // Extraer el challenge del clientDataJSON
+        const clientDataJSON = new TextDecoder().decode(
+            isoBase64URL.toBuffer(body.response.clientDataJSON)
+        );
+        const clientData = JSON.parse(clientDataJSON);
+        const expectedChallenge = clientData.challenge;
+        
+        console.log("Challenge extraído:", expectedChallenge);
+
+        const storedChallenge = passkeyChallengeStore.get(expectedChallenge);
+        if (!storedChallenge) {
+            return res.status(400).json({ mensaje: "Challenge no encontrado o expirado." });
+        }
+
+        const credentialID = body.rawId || body.id;
+        console.log("Buscando credencial con ID:", credentialID);
+
+        const sqlGetKey = "SELECT * FROM passkey_credentials WHERE id = ?";
+        
+        connection.query(sqlGetKey, [credentialID], async (err, results) => {
+            if (err) {
+                console.error("Error en DB:", err);
+                return res.status(500).json({ mensaje: "Error de base de datos." });
+            }
+            
+            if (results.length === 0) {
+                console.error("Credencial no encontrada para ID:", credentialID);
+                return res.status(404).json({ mensaje: "Passkey no registrada." });
+            }
+
+            const cred = results[0];
+            console.log("Credencial encontrada:", {
+                id: cred.id,
+                counter: cred.counter,
+                hasPublicKey: !!cred.public_key_base64
+            });
+
+            try {
+                // ✅ v8.3.4: Estructura correcta del authenticator
+                const authenticator = {
+                    credentialID: isoBase64URL.toBuffer(cred.id),
+                    credentialPublicKey: isoBase64URL.toBuffer(cred.public_key_base64),
+                    counter: parseInt(cred.counter) || 0,
+                    transports: cred.transports ? cred.transports.split(',') : [],
+                };
+
+                console.log("Authenticator preparado v8.3.4:", {
+                    credentialIDLength: authenticator.credentialID.length,
+                    credentialPublicKeyLength: authenticator.credentialPublicKey.length,
+                    counter: authenticator.counter,
+                    transports: authenticator.transports
+                });
+
+                const verification = await verifyAuthenticationResponse({
+                    response: body,
+                    expectedChallenge: storedChallenge,
+                    expectedOrigin: origin,
+                    expectedRPID: rpID,
+                    authenticator,
+                });
+
+                console.log("Resultado verificación v8.3.4:", {
+                    verified: verification.verified,
+                    hasAuthInfo: !!verification.authenticationInfo
+                });
+
+                if (verification.verified && verification.authenticationInfo) {
+                    const newCounter = verification.authenticationInfo.newCounter;
+                    console.log("Nuevo counter:", newCounter);
+                    
+                    const sqlUpdate = "UPDATE passkey_credentials SET counter = ? WHERE id = ?";
+                    connection.query(sqlUpdate, [newCounter, credentialID]);
+
+                    const sqlGetUser = "SELECT * FROM usuarios WHERE id = ?";
+                    connection.query(sqlGetUser, [cred.user_id], (errUser, userResults) => {
+                        if (errUser || userResults.length === 0) {
+                            return res.status(500).json({ mensaje: "Usuario no encontrado." });
+                        }
+
+                        const usuario = userResults[0];
+                        const accessToken = generateAccessToken(usuario.id, usuario.correo);
+                        const refreshToken = generateRefreshToken(usuario.id);
+                        storeRefreshToken(usuario.id, refreshToken);
+                        const sessionId = createSession(usuario.id, "jwt-passkey");
+
+                        passkeyChallengeStore.delete(expectedChallenge);
+                        
+                        console.log(">>> Login exitoso para:", usuario.correo);
+                        res.json({
+                            tfa_required: false,
+                            accessToken,
+                            refreshToken,
+                            sessionId,
+                            nombre: usuario.nombre
+                        });
+                    });
+                } else {
+                    console.error("Verificación fallida");
+                    res.status(401).json({ mensaje: "Verificación de Passkey fallida." });
+                }
+            } catch (error) {
+                console.error("Error en verificación:", error);
+                console.error("Stack:", error.stack);
+                res.status(500).json({ 
+                    mensaje: "Error interno en verificación", 
+                    error: error.message 
+                });
+            }
+        });
+    } catch (error) {
+        console.error("Error general:", error);
+        res.status(500).json({ 
+            mensaje: "Error procesando la solicitud", 
+            error: error.message 
+        });
     }
 });
 
